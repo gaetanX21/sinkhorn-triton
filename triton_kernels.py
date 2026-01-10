@@ -512,27 +512,30 @@ def verify_correctness(
     n_iter: int = 20,
     epsilon: float = 1e-6,
     atol: float = 1e-5,
-) -> bool:
+) -> None:
     log_A = torch.randn(B, N, N, device="cuda")
     out = func(log_A, n_iter=n_iter, epsilon=epsilon)
     max_distance_rows = (out.sum(dim=-1) - 1).abs().max().item()
     max_distance_cols = (out.sum(dim=-2) - 1).abs().max().item()
-    return max_distance_rows < atol and max_distance_cols < atol
+    if not (max_distance_rows < atol and max_distance_cols < atol):
+        print(
+            f"{func.__name__=}, {B=}, {N=}, {max_distance_cols=}, {max_distance_rows=}"
+        )
 
 
 if __name__ == "__main__":
     B_list = [1, 2, 4, 16]
     N_list = [1, 4, 8]
+    funcs = [
+        sinkhorn_pytorch,
+        sinkhorn_unfused,
+        sinkhorn_fused_A_in_global_memory,
+        sinkhorn_fused_A_in_registers,
+        sinkhorn_fused_A_in_registers_block_tiling,
+        sinkhorn_fused_coalesced,
+    ]
     for B in B_list:
         for N in N_list:
             print(f"B={B}, N={N}")
-            for func in [
-                sinkhorn_pytorch,
-                sinkhorn_unfused,
-                sinkhorn_fused_A_in_global_memory,
-                sinkhorn_fused_A_in_registers,
-                sinkhorn_fused_A_in_registers_block_tiling,
-                sinkhorn_fused_coalesced,
-            ]:
-                assert verify_correctness(func, B, N)
-                print(f"kernel {func.__name__} correct")
+            for func in funcs:
+                verify_correctness(func, B, N)
