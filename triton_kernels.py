@@ -8,7 +8,7 @@ import triton.language as tl
 def sinkhorn_pytorch(
     log_A: torch.Tensor,  # logits
     n_iter: int,  # increase for better convergence
-    epsilon: float = 1e-6,  # numerical stability
+    epsilon: float,  # numerical stability
 ) -> torch.Tensor:
     # pytorch baseline for comparison with the triton kernels
     A = torch.exp(log_A)
@@ -335,8 +335,8 @@ def sinkhorn_fused_coalesced_kernel(
 
 def sinkhorn_unfused(
     log_A: torch.Tensor,
-    n_iter: int = 20,
-    epsilon: float = 1e-6,
+    n_iter: int,
+    epsilon: float,
 ) -> torch.Tensor:
     # unfused version, iterates between row and column normalization kernels
     # slow because r and c in global memory (VRAM) + kernel launch overhead
@@ -380,8 +380,8 @@ def sinkhorn_unfused(
 
 def sinkhorn_fused_A_in_global_memory(
     log_A: torch.Tensor,
-    n_iter: int = 20,
-    epsilon: float = 1e-6,
+    n_iter: int,
+    epsilon: float,
 ) -> torch.Tensor:
     A = torch.exp(log_A).contiguous()  # forces memory layout of A to be Row Major
     Out = torch.empty_like(A)  # A contiguous -> Out GUARANTEED to have same stride as A
@@ -407,8 +407,8 @@ def sinkhorn_fused_A_in_global_memory(
 
 def sinkhorn_fused_A_in_registers(
     log_A: torch.Tensor,
-    n_iter: int = 20,
-    epsilon: float = 1e-6,
+    n_iter: int,
+    epsilon: float,
 ) -> torch.Tensor:
     A = torch.exp(log_A).contiguous()  # forces memory layout of A to be Row Major
     Out = torch.empty_like(A)  # A contiguous -> Out GUARANTEED to have same stride as A
@@ -434,8 +434,8 @@ def sinkhorn_fused_A_in_registers(
 
 def sinkhorn_fused_A_in_registers_block_tiling(
     log_A: torch.Tensor,
-    n_iter: int = 20,
-    epsilon: float = 1e-6,
+    n_iter: int,
+    epsilon: float,
 ) -> torch.Tensor:
     A = torch.exp(log_A).contiguous()  # forces memory layout of A to be Row Major
     Out = torch.empty_like(A)  # A contiguous -> Out GUARANTEED to have same stride
@@ -472,8 +472,8 @@ def sinkhorn_fused_A_in_registers_block_tiling(
 
 def sinkhorn_fused_coalesced(
     log_A: torch.Tensor,
-    n_iter: int = 20,
-    epsilon: float = 1e-6,
+    n_iter: int,
+    epsilon: float,
 ) -> torch.Tensor:
     log_A = log_A.contiguous()  # forces memory layout of A to be Row Major
     Out = torch.empty_like(log_A)  # A contiguous -> Out GUARANTEED to have same stride
@@ -509,23 +509,24 @@ def verify_correctness(
     func: Callable,
     B: int,
     N: int,
-    n_iter: int = 20,
-    epsilon: float = 1e-6,
-    atol: float = 1e-5,
+    n_iter: int,
+    epsilon: float,
+    atol: float,
 ) -> None:
     log_A = torch.randn(B, N, N, device="cuda")
     out = func(log_A, n_iter=n_iter, epsilon=epsilon)
     max_distance_rows = (out.sum(dim=-1) - 1).abs().max().item()
     max_distance_cols = (out.sum(dim=-2) - 1).abs().max().item()
     if not (max_distance_rows < atol and max_distance_cols < atol):
-        print(
-            f"{func.__name__=}, {B=}, {N=}, {max_distance_cols=}, {max_distance_rows=}"
-        )
+        print(f"{func.__name__=}, {max_distance_cols=:.2g}, {max_distance_rows=:.2g}")
 
 
 if __name__ == "__main__":
     B_list = [1, 2, 4, 16]
     N_list = [1, 4, 8]
+    n_iter = 20
+    epsilon = 1e-9
+    atol = 1e-5
     funcs = [
         sinkhorn_pytorch,
         sinkhorn_unfused,
@@ -538,4 +539,4 @@ if __name__ == "__main__":
         for N in N_list:
             print(f"B={B}, N={N}")
             for func in funcs:
-                verify_correctness(func, B, N)
+                verify_correctness(func, B, N, n_iter, epsilon, atol)
