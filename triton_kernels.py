@@ -10,7 +10,7 @@ def sinkhorn_pytorch(
     n_iter: int,  # increase for better convergence
     epsilon: float,  # numerical stability
 ) -> torch.Tensor:
-    # pytorch baseline for comparison with the triton kernels
+    """PyTorch baseline for comparison with the triton kernels."""
     A = torch.exp(log_A)
     B, N, _ = A.shape
 
@@ -18,88 +18,13 @@ def sinkhorn_pytorch(
     r = torch.ones(B, N, device=A.device)
     c = torch.ones(B, N, device=A.device)
 
+    # loop
     for _ in range(n_iter):
         r = 1.0 / ((A * c[:, None, :]).sum(dim=-1) + epsilon)  # row normalization
         c = 1.0 / ((A * r[:, :, None]).sum(dim=-2) + epsilon)  # column normalization
 
     # final scaled matrix
     return A * r[:, :, None] * c[:, None, :]
-
-
-@triton.jit
-def row_normalization_kernel(
-    A_ptr,
-    r_ptr,
-    c_ptr,
-    stride_b,
-    stride_h,
-    stride_w,
-    N,
-    BLOCK_SIZE: tl.constexpr,
-    epsilon: tl.constexpr,
-):
-    # we use 2D grid (B, N) where B is batch size
-    # pid_0 = which matrix in batch
-    # pid_1 = which row in matrix
-    pid_batch = tl.program_id(0)
-    pid_row = tl.program_id(1)
-
-    # 1. pointers
-    row_start_ptr = A_ptr + pid_batch * stride_b + pid_row * stride_h
-    c_start_ptr = c_ptr + pid_batch * N
-
-    # 2. loading data
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < N
-    # load entire ROW of A -> stride_w (1) -> coalesced memory access (fast)
-    a_ptrs = row_start_ptr + offsets * stride_w
-    a_vals = tl.load(a_ptrs, mask=mask, other=0.0)
-    # load entire vector c
-    c_ptrs = c_start_ptr + offsets
-    c_vals = tl.load(c_ptrs, mask=mask, other=0.0)
-
-    # 3. math
-    total = tl.sum(a_vals * c_vals)
-
-    # 4. write result
-    r_val = 1.0 / (total + epsilon)
-    r_out_ptr = r_ptr + pid_batch * N + pid_row
-    tl.store(r_out_ptr, r_val)
-
-
-@triton.jit
-def col_normalization_kernel(
-    A_ptr,
-    r_ptr,
-    c_ptr,
-    stride_b,
-    stride_h,
-    stride_w,
-    N,
-    BLOCK_SIZE: tl.constexpr,
-    epsilon: tl.constexpr,
-):
-    pid_batch = tl.program_id(0)
-    pid_col = tl.program_id(1)
-
-    col_start_ptr = A_ptr + pid_batch * stride_b
-    r_start_ptr = r_ptr + pid_batch * N
-
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < N  # safety mask if N is not power of 2
-
-    # XXX: load entire COLUMN of A -> stride_h (N) -> strided memory access (slow)
-    a_ptrs = col_start_ptr + offsets * stride_h + pid_col * stride_w
-    a_vals = tl.load(a_ptrs, mask=mask, other=0.0)
-
-    r_ptrs = r_start_ptr + offsets
-    r_vals = tl.load(r_ptrs, mask=mask, other=0.0)
-
-    total = tl.sum(a_vals * r_vals)
-
-    c_val = 1.0 / (total + epsilon)
-    c_out_ptr = c_ptr + pid_batch * N + pid_col
-    tl.store(c_out_ptr, c_val)
 
 
 @triton.jit
@@ -331,51 +256,6 @@ def sinkhorn_fused_coalesced_kernel(
     # write back to global memory
     out_ptrs = Out_ptr + global_idxs
     tl.store(out_ptrs, out_vals, mask=mask)
-
-
-def sinkhorn_unfused(
-    log_A: torch.Tensor,
-    n_iter: int,
-    epsilon: float,
-) -> torch.Tensor:
-    # unfused version, iterates between row and column normalization kernels
-    # slow because r and c in global memory (VRAM) + kernel launch overhead
-    B = log_A.shape[0]
-    N = log_A.shape[1]
-    A = torch.exp(log_A)
-    r = torch.ones(B, N, device=A.device)
-    c = torch.ones(B, N, device=A.device)
-
-    grid = (B, N)
-    BLOCK_SIZE = triton.next_power_of_2(N)
-
-    for _ in range(n_iter):
-        # launch row normalization kernel
-        row_normalization_kernel[grid](
-            A,
-            r,
-            c,
-            A.stride(0),
-            A.stride(1),
-            A.stride(2),
-            N,
-            BLOCK_SIZE,  # type: ignore
-            epsilon,  # type: ignore
-        )
-        # launch column normalization kernel
-        col_normalization_kernel[grid](
-            A,
-            r,
-            c,
-            A.stride(0),
-            A.stride(1),
-            A.stride(2),
-            N,
-            BLOCK_SIZE,  # type: ignore
-            epsilon,  # type: ignore
-        )
-
-    return A * r[:, :, None] * c[:, None, :]
 
 
 def sinkhorn_fused_A_in_global_memory(
