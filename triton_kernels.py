@@ -107,7 +107,7 @@ def sinkhorn_A_in_global_memory_kernel(
 
 @triton.jit
 def sinkhorn_A_in_registers_kernel(
-    A_ptr,
+    log_A_ptr,
     Out_ptr,
     stride_b,
     stride_h,
@@ -120,27 +120,29 @@ def sinkhorn_A_in_registers_kernel(
     """Second attempt: load full matrix A in registers to minimize global memory access.
     Note: this only works for small N (e.g. N<=128) because of register pressure
     i.e. we don't want registers spilling over into "local memory" (VRAM)."""
+    # 1D grid (B,) -> each block handles one full matrix A of size (N,N)
     pid = tl.program_id(0)
 
-    A_base = A_ptr + pid * stride_b
+    log_A_base = log_A_ptr + pid * stride_b
     offsets = tl.arange(0, BLOCK_SIZE)
-    A_ptrs = A_base + offsets[:, None] * stride_h + offsets[None, :] * stride_w
+    log_A_ptrs = log_A_base + offsets[:, None] * stride_h + offsets[None, :] * stride_w
     mask = (offsets[:, None] < N) & (offsets[None, :] < N)
-    # load full matrix A[pid] of size (N,N) in registers
-    A_full = tl.load(A_ptrs, mask=mask, other=0.0)
+    # load full matrix log_A[pid] of size (N,N) in registers
+    log_A_vals = tl.load(log_A_ptrs, mask=mask, other=-float("inf"))
+    A_vals = tl.exp(log_A_vals)  # on-the-fly exponentiation
 
     r = tl.full((BLOCK_SIZE,), 1.0, dtype=tl.float32)
     c = tl.full((BLOCK_SIZE,), 1.0, dtype=tl.float32)
 
     # loop -> everything in registers now, no more loads!
     for _ in range(n_iter):
-        denom_r = tl.sum(A_full * c[None, :], axis=1)  # sum across cols
+        denom_r = tl.sum(A_vals * c[None, :], axis=1)  # sum across cols
         r = 1.0 / (denom_r + epsilon)
 
-        denom_c = tl.sum(A_full * r[:, None], axis=0)  # sum across rows
+        denom_c = tl.sum(A_vals * r[:, None], axis=0)  # sum across rows
         c = 1.0 / (denom_c + epsilon)
 
-    out = A_full * r[:, None] * c[None, :]
+    out = A_vals * r[:, None] * c[None, :]
     Out_base = Out_ptr + pid * stride_b
     # NOTE: works because A.strides() == Out.strides() (because A contiguous and Out=torch.empty_like(A))
     out_ptrs = Out_base + offsets[:, None] * stride_h + offsets[None, :] * stride_w
@@ -149,105 +151,63 @@ def sinkhorn_A_in_registers_kernel(
 
 @triton.jit
 def sinkhorn_A_in_registers_block_packing_kernel(
-    A_ptr,
+    log_A_ptr,
     Out_ptr,
     stride_b,
     stride_h,
     stride_w,
     B: int,
-    N: tl.constexpr,  # loop unrolling (we assume small N for this kernel)
-    matrices_per_block: tl.constexpr,
+    N: int,
+    N_next: tl.constexpr,
+    block_batch: tl.constexpr,
     n_iter: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
     epsilon: tl.constexpr,
 ):
     """Third attempt: load several matrices A in registers to better utilize GPU threads.
-    Each block processes 'matrices_per_block' matrices of size (N,N)."""
+    Each block processes block_batch matrices of size (N,N)."""
+    # 1D grid (num_blocks,) -> each block handles block_batch matrices of size (N,N)
     pid = tl.program_id(0)
 
-    offs_b = tl.arange(0, matrices_per_block)
-    offs_h = tl.arange(0, N)
-    offs_w = tl.arange(0, N)
+    offs_b = tl.arange(0, block_batch)
+    offs_h = tl.arange(0, N_next)
+    offs_w = tl.arange(0, N_next)
 
-    # 3D pointers: shape (matrices_per_block, N, N)
-    # we use broadcasting to expand dimensions
-    batch_idxs = pid * matrices_per_block + offs_b
     # ensure we don't load/store matrices beyond batch size B
-    mask = (batch_idxs < B)[:, None, None]
+    batch_idxs = pid * block_batch + offs_b
+    mask_b = (batch_idxs < B)[:, None, None]
+    # ensure we don't load/store rows/cols beyond matrix size N
+    mask_h = (offs_h < N)[None, :, None]
+    mask_w = (offs_w < N)[None, None, :]
+    mask_3d = mask_b & mask_h & mask_w
 
-    A_base = A_ptr + pid * BLOCK_SIZE
+    # skip block_batch matrices for every previous block
+    log_A_base = log_A_ptr + pid * block_batch * stride_b
+    # 3D pointers: shape (block_batch, N, N)
+    # we use broadcasting to expand dimensions
     offs_3d = (
         offs_b[:, None, None] * stride_b
         + offs_h[None, :, None] * stride_h
         + offs_w[None, None, :] * stride_w
     )
-    A_ptrs = A_base + offs_3d
+    log_A_ptrs = log_A_base + offs_3d
     # load batch of matrices in registers
-    A_full = tl.load(A_ptrs, mask=mask, other=0.0)
-
-    r = tl.full((matrices_per_block, N, 1), 1.0, dtype=tl.float32)
-    c = tl.full((matrices_per_block, 1, N), 1.0, dtype=tl.float32)
-
-    for _ in range(n_iter):
-        denom_r = tl.sum(A_full * c, axis=2, keep_dims=True)
-        r = 1.0 / (denom_r + epsilon)
-
-        denom_c = tl.sum(A_full * r, axis=1, keep_dims=True)
-        c = 1.0 / (denom_c + epsilon)
-
-    out = A_full * r * c
-    Out_base = Out_ptr + pid * BLOCK_SIZE
-    out_ptrs = Out_base + offs_3d
-    tl.store(out_ptrs, out, mask=mask)
-
-
-@triton.jit
-def sinkhorn_coalesced_kernel(
-    log_A_ptr,  # read log_A to save memory bandwidth (exp will cost one back and forth in registers)
-    Out_ptr,
-    total_elements: int,  # for masking (safety)
-    N: tl.constexpr,
-    n_iter: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    matrices_per_block: tl.constexpr,
-    epsilon: tl.constexpr,
-):
-    """Fourth attempt: coalesced memory access by having each block process several matrices.
-    Memory is treated as a 1D array of floats, each block loads a contiguous chunk of data.
-    This ensures perfect coalescing when reading from global memory."""
-    pid = tl.program_id(0)
-
-    # treat memory as 1D array of floats
-    # block size must be matrices_per_block * N * N
-    # load contiguous chunk of data (perfect coalescing)
-    block_offset = pid * BLOCK_SIZE
-    offsets = tl.arange(0, BLOCK_SIZE)
-    global_idxs = block_offset + offsets
-    mask = global_idxs < total_elements  # for masking (safety)
-
-    log_A_ptrs = log_A_ptr + global_idxs
-    log_A_vals = tl.load(log_A_ptrs, mask=mask, other=-float("inf"))
+    log_A_vals = tl.load(log_A_ptrs, mask=mask_3d, other=-float("inf"))
     A_vals = tl.exp(log_A_vals)
 
-    # reshape into matrices for sinkhorn math
-    # view as (mat_idx, row, cols)
-    A_view = tl.reshape(A_vals, (matrices_per_block, N, N))
-
-    r = tl.full((matrices_per_block, N, 1), 1.0, dtype=tl.float32)
-    c = tl.full((matrices_per_block, 1, N), 1.0, dtype=tl.float32)
+    r = tl.full((block_batch, N_next, 1), 1.0, dtype=tl.float32)
+    c = tl.full((block_batch, 1, N_next), 1.0, dtype=tl.float32)
 
     for _ in range(n_iter):
-        denom_r = tl.sum(A_view * c, axis=2, keep_dims=True)
+        denom_r = tl.sum(A_vals * c, axis=2, keep_dims=True)
         r = 1.0 / (denom_r + epsilon)
 
-        denom_c = tl.sum(A_view * r, axis=1, keep_dims=True)
+        denom_c = tl.sum(A_vals * r, axis=1, keep_dims=True)
         c = 1.0 / (denom_c + epsilon)
 
-    out_view = A_view * r * c
-    # flatten back to match load structure
-    out_vals = tl.reshape(out_view, (BLOCK_SIZE,))
-    out_ptrs = Out_ptr + global_idxs
-    tl.store(out_ptrs, out_vals, mask=mask)
+    out = A_vals * r * c
+    Out_base = Out_ptr + pid * block_batch * stride_b
+    out_ptrs = Out_base + offs_3d
+    tl.store(out_ptrs, out, mask=mask_3d)
 
 
 def sinkhorn_A_in_global_memory(
@@ -282,19 +242,19 @@ def sinkhorn_A_in_registers(
     n_iter: int,
     epsilon: float,
 ) -> torch.Tensor:
-    A = torch.exp(log_A).contiguous()
-    Out = torch.empty_like(A)
-    B, N, _ = A.shape
+    log_A = log_A.contiguous()
+    Out = torch.empty_like(log_A)
+    B, N, _ = log_A.shape
     grid = (B,)
     BLOCK_SIZE = triton.next_power_of_2(N)
 
     # launch kernel
     sinkhorn_A_in_registers_kernel[grid](
-        A,
+        log_A,
         Out,
-        stride_b=A.stride(0),
-        stride_h=A.stride(1),
-        stride_w=A.stride(2),
+        stride_b=log_A.stride(0),
+        stride_h=log_A.stride(1),
+        stride_w=log_A.stride(2),
         N=N,
         n_iter=n_iter,  # type: ignore
         BLOCK_SIZE=BLOCK_SIZE,  # type: ignore
@@ -308,69 +268,34 @@ def sinkhorn_A_in_registers_block_packing(
     log_A: torch.Tensor,
     n_iter: int,
     epsilon: float,
-) -> torch.Tensor:
-    A = torch.exp(log_A).contiguous()
-    Out = torch.empty_like(A)
-    B, N, _ = log_A.shape
-
-    # block packing
-    TARGET_BLOCK_SIZE = 256  # sweep spot
-    # block sizing strategy: close to 256, but MUST be multiple of N^2 for reshape to work
-    elements_per_matrix = N * N
-    assert elements_per_matrix <= TARGET_BLOCK_SIZE  # need small N for coalesced access
-    # blocks now contain batch of matrices instead of single matrix
-    matrices_per_block = TARGET_BLOCK_SIZE // elements_per_matrix
-    EXACT_BLOCK_SIZE = matrices_per_block * elements_per_matrix
-    num_blocks = triton.cdiv(B, matrices_per_block)  # ceil so we don't drop data
-    grid = (num_blocks,)
-
-    # launch kernel
-    sinkhorn_A_in_registers_block_packing_kernel[grid](
-        A_ptr=A,
-        Out_ptr=Out,
-        stride_b=A.stride(0),
-        stride_h=A.stride(1),
-        stride_w=A.stride(2),
-        B=B,
-        N=N,  # type: ignore
-        matrices_per_block=matrices_per_block,  # type: ignore
-        n_iter=n_iter,  # type: ignore
-        BLOCK_SIZE=EXACT_BLOCK_SIZE,  # type: ignore
-        epsilon=epsilon,  # type: ignore
-    )
-
-    return Out
-
-
-def sinkhorn_coalesced(
-    log_A: torch.Tensor,
-    n_iter: int,
-    epsilon: float,
+    TARGET_BLOCK_SIZE: int,
 ) -> torch.Tensor:
     log_A = log_A.contiguous()
     Out = torch.empty_like(log_A)
     B, N, _ = log_A.shape
-    total_elements = B * N * N  # needed for masking
+    N_next = triton.next_power_of_2(N)
 
     # block packing
-    TARGET_BLOCK_SIZE = 256  # sweep spot
-    # block sizing strategy: close to 256, but MUST be multiple of N^2 for reshape to work
-    elements_per_matrix = N * N
-    assert elements_per_matrix <= TARGET_BLOCK_SIZE  # need small N for coalesced access
-    # blocks now contain chunks of matrices instead of a single (small) matrix
-    matrices_per_block = TARGET_BLOCK_SIZE // elements_per_matrix
-    num_blocks = triton.cdiv(B, matrices_per_block)  # ceil so we don't drop data
+    # TARGET_BLOCK_SIZE = 128  # clip to [256, 1024], scaling with N^2
+    assert N <= TARGET_BLOCK_SIZE  # need small N for coalesced access
+    # blocks now contain batch of matrices instead of single matrix
+    wanted_block_batch = min(B, TARGET_BLOCK_SIZE // N)  # heuristic
+    actual_block_batch = triton.next_power_of_2(wanted_block_batch)
+    num_blocks = triton.cdiv(B, actual_block_batch)  # ceil so we don't drop data
     grid = (num_blocks,)
 
     # launch kernel
-    sinkhorn_coalesced_kernel[grid](
-        log_A,
-        Out,
-        total_elements=total_elements,
-        N=N,  # type: ignore
-        matrices_per_block=matrices_per_block,  # type: ignore
+    sinkhorn_A_in_registers_block_packing_kernel[grid](
+        log_A_ptr=log_A,
+        Out_ptr=Out,
+        stride_b=log_A.stride(0),
+        stride_h=log_A.stride(1),
+        stride_w=log_A.stride(2),
+        B=B,
+        N=N,
+        N_next=N_next,  # type: ignore
+        block_batch=actual_block_batch,  # type: ignore
         n_iter=n_iter,  # type: ignore
-        BLOCK_SIZE=TARGET_BLOCK_SIZE,  # type: ignore
         epsilon=epsilon,  # type: ignore
     )
 
@@ -394,10 +319,11 @@ def verify_correctness(
 
 
 if __name__ == "__main__":
-    B_list = [1, 4, 16]
-    N_list = [2, 4, 8]
+    # include non-power of 2 to test masking
+    B_list = [1, 2, 3, 4, 255, 257, 2047, 2049]
+    N_list = [1, 2, 3, 4, 11, 33]
     n_iter = 20
-    epsilon = 1e-9
+    epsilon = 1e-7
     atol = 1e-5
     funcs = [
         sinkhorn_pytorch,
@@ -405,7 +331,6 @@ if __name__ == "__main__":
         sinkhorn_A_in_global_memory,
         sinkhorn_A_in_registers,
         sinkhorn_A_in_registers_block_packing,
-        sinkhorn_coalesced,
     ]
     for B in B_list:
         for N in N_list:
