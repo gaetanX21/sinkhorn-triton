@@ -43,10 +43,10 @@ The script will automatically generate plots and a CSV file with the results. It
 | :--- | :--- | :--- | :--- |
 | `N` | `int` | `4` | Matrix size ($N \times N$). Best performance when $N \le 16$. |
 | `n_iter` | `int` | `20` | Number of Sinkhorn iterations. Increase for better convergence. |
-| `epsilon` | `float` | `1e-6` | Numerical stability constant. |
-| `log2_B_min` | `int` | `0` | Starting exponent for Batch Size ($B_{min} = 2^{\texttt{log\_2\_B\_min}}$). |
-| `log2_B_max` | `int` | `24` | Ending exponent for Batch Size (inclusive, $B_{max} = 2^{\texttt{log\_2\_B\_max}}$). |
+| `log2_B_min` | `int` | `0` | Starting exponent for Batch Size ($B_{min} = 2^{\texttt{log\\_2\\_B\\_min}}$). |
+| `log2_B_max` | `int` | `24` | Ending exponent for Batch Size (inclusive, $B_{max} = 2^{\texttt{log\\_2\\_B\\_max}}$). |
 | `log_2_B_step` | `int` | `2` | Step size for the exponent sweep (e.g., $2^0, 2^2, 2^4 \dots$). |
+| `epsilon` | `float` | `1e-6` | Numerical stability constant. |
 
 You can easily customize the parameters using command line arguments:
 ```bash
