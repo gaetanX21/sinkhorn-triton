@@ -1,4 +1,4 @@
-# Fast Sinkhorn with Fused Triton Kernels
+# Fused & Furious: Sinkhorn Triton Kernels
 
 <div align="center">
   <img alt="cover" src="cover.jpg" width="50%" height="50%">
