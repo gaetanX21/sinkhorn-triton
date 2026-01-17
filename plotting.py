@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 
-FIG_DIR = "figures"
+PLOT_DIR = "figures"
 VIVID_GREEN = "#00ff22"  # pretty cool imo
 
 sns.set_style("whitegrid")
@@ -39,8 +39,8 @@ def standard_plot(filename: str):
             # save
             plt.legend()
             plt.tight_layout()
-            plt.savefig(f"{FIG_DIR}/{filename}", dpi=200)
-            print(f"Saved {FIG_DIR}/{filename}")
+            plt.savefig(f"{PLOT_DIR}/{filename}", dpi=200)
+            print(f"Saved {PLOT_DIR}/{filename}")
             plt.close()
 
         return inner
