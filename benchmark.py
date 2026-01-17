@@ -105,10 +105,11 @@ def run_benchmark(
     n_iter: int = 20,  # default mHC value (increase for better convergence)
     epsilon: float = 1e-6,  # numerical stability
     log2_B_min=0,
-    log2_B_max=13,
+    log2_B_max=24,
+    log_2_B_step=2,
 ):
     # large sweep to observe all hardware regimes
-    B_list = [1 << (2 * i) for i in range(log2_B_min, log2_B_max)]  # 13
+    B_list = [1 << i for i in range(log2_B_min, log2_B_max + 1, log_2_B_step)]
     providers = {
         "sinkhorn_pytorch": sinkhorn_pytorch,
         "sinkhorn_pytorch_compiled": sinkhorn_pytorch_compiled,
@@ -133,6 +134,7 @@ def run_benchmark(
     results = benchmark(providers, B_list, N, n_iter, epsilon)
     print("Done benchmarking.")
     df = pd.DataFrame(results, columns=columns)
+    df.to_csv("results.csv", index=False)
 
     print("\n#### Plotting ###")
     os.makedirs(PLOT_DIR, exist_ok=True)
